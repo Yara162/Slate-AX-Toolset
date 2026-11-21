@@ -1,0 +1,256 @@
+#!/bin/sh
+# avdhcp - hand out DHCP addresses from per-manufacturer ranges (by MAC OUI)
+# For OpenWrt / GL.iNet (busybox ash). See README.md.
+#
+#   avdhcp generate   print the dnsmasq config that would be applied
+#   avdhcp apply      validate, install into /etc/dnsmasq.conf, restart dnsmasq
+#   avdhcp revert     remove everything avdhcp added, restart dnsmasq
+#   avdhcp leases     current leases with vendor + group, flags wrong-range ones
+#   avdhcp vendor MAC which vendor/group a MAC belongs to
+
+set -u
+
+DIR="${AVDHCP_DIR:-/etc/avdhcp}"
+VENDORS="$DIR/vendors.conf"
+RANGES="$DIR/ranges.conf"
+STATE="$DIR/.state"
+DNSMASQ_CONF="${DNSMASQ_CONF:-/etc/dnsmasq.conf}"
+BEGIN_MARK="# >>> avdhcp (generated - edit $RANGES instead) >>>"
+END_MARK="# <<< avdhcp <<<"
+TAGP="av_"   # tag prefix, keeps us clear of OpenWrt's own tags (lan, known...)
+
+die()  { echo "avdhcp: error: $*" >&2; exit 1; }
+warn() { echo "avdhcp: warning: $*" >&2; }
+
+have_uci() { command -v uci >/dev/null 2>&1; }
+
+# ---------- IP helpers ----------
+ip2int() {  # a.b.c.d -> integer, fails on junk
+    echo "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' || return 1
+    local IFS=.
+    set -- $1
+    for o in "$@"; do [ "$o" -le 255 ] || return 1; done
+    echo $(( ($1 << 24) | ($2 << 16) | ($3 << 8) | $4 ))
+}
+int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+prefix2mask() { echo $(( (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF )); }
+
+lan_info() {  # sets LAN_IP_I, NET_I, BCAST_I, LAN_CIDR
+    local ip="${LAN_IP:-}" mask="${LAN_MASK:-}" pfx m
+    if [ -z "$ip" ] && have_uci; then
+        ip=$(uci -q get network.lan.ipaddr)
+        mask=$(uci -q get network.lan.netmask)
+    fi
+    [ -n "$ip" ] || die "can't find LAN IP (uci network.lan.ipaddr); set LAN_IP/LAN_MASK"
+    ip=${ip%% *}                       # list form: take first
+    case "$ip" in */*) pfx=${ip#*/}; ip=${ip%/*}; m=$(prefix2mask "$pfx") ;;
+                  *)   m=$(ip2int "${mask:-255.255.255.0}") || die "bad netmask $mask" ;;
+    esac
+    LAN_IP_I=$(ip2int "$ip") || die "bad LAN IP $ip"
+    NET_I=$(( LAN_IP_I & m ))
+    BCAST_I=$(( NET_I | (~m & 0xFFFFFFFF) ))
+    LAN_CIDR="$(int2ip $NET_I) - $(int2ip $BCAST_I) (router $ip)"
+}
+
+# ---------- config parsing ----------
+strip() { sed -e 's/#.*//' -e 's/[[:space:]]\{1,\}/ /g' -e 's/^ //' -e 's/ $//' "$1" | grep -v '^$'; }
+
+vendor_prefixes() {  # vendor -> prefixes (space separated), empty if unknown
+    strip "$VENDORS" | awk -v v="$1" '$1==v { $1=""; sub(/^ /,""); print; exit }'
+}
+
+# prefix (6/7/9 hex) -> dnsmasq dhcp-mac patterns, one per line
+expand_prefix() {
+    local p h1 h2 h3 h4 n d
+    p=$(echo "$1" | tr 'A-F' 'a-f' | tr -d ':.-')
+    echo "$p" | grep -Eq '^[0-9a-f]+$' || { warn "skipping bad prefix '$1'"; return; }
+    h1=$(echo "$p" | cut -c1-2); h2=$(echo "$p" | cut -c3-4); h3=$(echo "$p" | cut -c5-6)
+    case ${#p} in
+        6) echo "$h1:$h2:$h3:*:*:*" ;;
+        7) n=$(echo "$p" | cut -c7)          # /28: 4th byte's high nibble fixed
+           for d in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do echo "$h1:$h2:$h3:$n$d:*:*"; done ;;
+        9) h4=$(echo "$p" | cut -c7-8); n=$(echo "$p" | cut -c9)   # /36
+           for d in 0 1 2 3 4 5 6 7 8 9 a b c d e f; do echo "$h1:$h2:$h3:$h4:$n$d:*"; done ;;
+        *) warn "skipping prefix '$1' (need 6, 7 or 9 hex digits)" ;;
+    esac
+}
+
+# Validates ranges.conf; writes normalized "group start_i end_i vendors..." to $1
+parse_ranges() {
+    local out="$1" seen_v="" ndef=0 line group start end vendors s e v
+    [ -f "$RANGES" ] || die "missing $RANGES"
+    [ -f "$VENDORS" ] || die "missing $VENDORS"
+    lan_info
+    LEASETIME=12h
+    : > "$out"
+    strip "$RANGES" | while read -r group start end vendors; do
+        if [ "$group" = leasetime ]; then echo "LEASE $start" >> "$out"; continue; fi
+        echo "$group" | grep -Eq '^[a-z0-9_]{1,24}$' || die "group name '$group' must be a-z 0-9 _"
+        [ -n "${end:-}" ] || die "group '$group': need start and end IP"
+        s=$(ip2int "$start") || die "group '$group': bad start IP '$start'"
+        e=$(ip2int "$end")   || die "group '$group': bad end IP '$end'"
+        [ "$s" -le "$e" ] || die "group '$group': start $start is after end $end"
+        [ "$s" -gt "$NET_I" ] && [ "$e" -lt "$BCAST_I" ] \
+            || die "group '$group': $start-$end is outside the LAN subnet $LAN_CIDR"
+        [ "$LAN_IP_I" -lt "$s" ] || [ "$LAN_IP_I" -gt "$e" ] \
+            || die "group '$group': range includes the router's own IP"
+        if [ "$group" = default ]; then
+            [ -z "${vendors:-}" ] || die "'default' takes no vendors (it catches everything else)"
+        else
+            [ -n "${vendors:-}" ] || die "group '$group': list at least one vendor (or call it 'default')"
+            for v in $vendors; do
+                [ -n "$(vendor_prefixes "$v")" ] || die "group '$group': vendor '$v' not in $VENDORS"
+            done
+        fi
+        grep -q "^G $group " "$out" && die "group '$group' listed twice"
+        echo "G $group $s $e ${vendors:-}" >> "$out"
+    done || exit 1
+
+    # cross-checks: overlaps, vendor in two groups, multiple defaults
+    awk '
+      $1=="G" { n++; g[n]=$2; s[n]=$3; e[n]=$4
+                if ($2=="default") d++
+                for (i=5;i<=NF;i++) { if ($i in owner) { print "vendor \"" $i "\" is in both " owner[$i] " and " $2; bad=1 } owner[$i]=$2 } }
+      END { if (d>1) { print "more than one default group"; bad=1 }
+            for (i=1;i<=n;i++) for (j=i+1;j<=n;j++)
+              if (s[i]<=e[j] && s[j]<=e[i]) { print "ranges overlap: " g[i] " and " g[j]; bad=1 }
+            exit bad }' "$out" >&2 || die "fix $RANGES"
+    grep -q '^G ' "$out" || die "no ranges defined in $RANGES"
+}
+
+# ---------- generate ----------
+generate() {
+    local tmp group s e vendors v p groups="" lease
+    tmp=$(mktemp); parse_ranges "$tmp"
+    lease=$(awk '$1=="LEASE"{l=$2} END{print l?l:"12h"}' "$tmp")
+    echo "$BEGIN_MARK"
+    echo "# LAN $LAN_CIDR"
+    grep '^G ' "$tmp" | while read -r _ group s e vendors; do
+        [ "$group" = default ] && continue
+        echo "# $group: $vendors"
+        for v in $vendors; do
+            for p in $(vendor_prefixes "$v"); do
+                expand_prefix "$p" | sed "s/^/dhcp-mac=set:$TAGP$group,/"
+            done
+        done
+    done
+    grep '^G ' "$tmp" | while read -r _ group s e vendors; do
+        [ "$group" = default ] && continue
+        echo "dhcp-range=tag:$TAGP$group,$(int2ip $s),$(int2ip $e),$lease"
+    done
+    groups=$(grep '^G ' "$tmp" | awk '$2!="default"{print $2}')
+    grep '^G default ' "$tmp" | while read -r _ group s e; do
+        printf 'dhcp-range='
+        for g in $groups; do printf 'tag:!%s%s,' "$TAGP" "$g"; done
+        echo "$(int2ip $s),$(int2ip $e),$lease"
+    done
+    grep -q '^G default ' "$tmp" || echo "# no 'default' group: devices from unlisted vendors get NO address"
+    echo "$END_MARK"
+    rm -f "$tmp"
+}
+
+strip_block() {  # print $1 without our block
+    [ -f "$1" ] || return 0
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0==b{skip=1;next} $0==e{skip=0;next} !skip' "$1"
+}
+
+restart_dnsmasq() {
+    [ -x /etc/init.d/dnsmasq ] || { warn "no /etc/init.d/dnsmasq (not OpenWrt?) - restart it yourself"; return; }
+    /etc/init.d/dnsmasq restart
+    sleep 2
+    pidof dnsmasq >/dev/null || die "dnsmasq did not start - check 'logread -e dnsmasq'; run 'avdhcp revert' to undo"
+    # OpenWrt's generated config must pull in /etc/dnsmasq.conf, or our lines are ignored
+    if [ "$DNSMASQ_CONF" = /etc/dnsmasq.conf ] && ls /var/etc/dnsmasq.conf* >/dev/null 2>&1 \
+       && ! grep -qs 'conf-file=/etc/dnsmasq.conf' /var/etc/dnsmasq.conf*; then
+        warn "dnsmasq's generated config doesn't include /etc/dnsmasq.conf - ranges may not be active"
+    fi
+}
+
+apply() {
+    local gen new
+    gen=$(mktemp); new=$(mktemp)
+    generate > "$gen" || { rm -f "$gen" "$new"; exit 1; }
+    if command -v dnsmasq >/dev/null 2>&1; then
+        dnsmasq --test --conf-file="$gen" >/dev/null 2>&1 \
+            || { dnsmasq --test --conf-file="$gen"; rm -f "$gen" "$new"; die "dnsmasq rejected the generated config"; }
+    fi
+    { strip_block "$DNSMASQ_CONF"; cat "$gen"; } > "$new"
+    cat "$new" > "$DNSMASQ_CONF"
+    rm -f "$gen" "$new"
+
+    # Turn OpenWrt's own LAN pool into static-only so it doesn't hand out
+    # addresses to everyone; our ranges do the dynamic part. Reservations still work.
+    if have_uci && uci -q get dhcp.lan >/dev/null; then
+        [ -f "$STATE" ] || echo "dynamicdhcp=$(uci -q get dhcp.lan.dynamicdhcp || echo unset)" > "$STATE"
+        uci set dhcp.lan.dynamicdhcp=0 && uci commit dhcp
+    fi
+    restart_dnsmasq
+    echo "avdhcp: applied. Groups:"
+    grep '^dhcp-range=' "$DNSMASQ_CONF" | sed -e 's/^dhcp-range=/  /' -e "s/tag:!$TAGP[a-z0-9_]*,//g" -e "s/tag:$TAGP//" \
+        -e 's/^  \([0-9]\)/  default,\1/'
+}
+
+revert() {
+    local new prev
+    new=$(mktemp); strip_block "$DNSMASQ_CONF" > "$new"; cat "$new" > "$DNSMASQ_CONF"; rm -f "$new"
+    if have_uci && [ -f "$STATE" ]; then
+        prev=$(sed -n 's/^dynamicdhcp=//p' "$STATE")
+        if [ "$prev" = unset ]; then uci -q delete dhcp.lan.dynamicdhcp; else uci set dhcp.lan.dynamicdhcp="$prev"; fi
+        uci commit dhcp; rm -f "$STATE"
+    fi
+    restart_dnsmasq
+    echo "avdhcp: reverted to stock DHCP"
+}
+
+# ---------- lookups ----------
+vendor_of() {  # MAC -> vendor key or "-"
+    local mac v p pp
+    mac=$(echo "$1" | tr 'A-F' 'a-f' | tr -d ':.-')
+    strip "$VENDORS" | while read -r v rest; do
+        for p in $rest; do
+            pp=$(echo "$p" | tr 'A-F' 'a-f')
+            case "$mac" in "$pp"*) echo "$v"; exit 0 ;; esac
+        done
+    done | head -n1 | grep . || echo "-"
+}
+
+group_of() {  # vendor -> group name (or default/-)
+    strip "$RANGES" | awk -v v="$1" '
+        $1=="leasetime"{next}
+        { for(i=4;i<=NF;i++) if ($i==v) { print $1; found=1; exit } if ($1=="default") d=1 }
+        END { if (!found) print (d ? "default" : "-") }'
+}
+
+leases() {
+    local lf exp mac ip host rest v g tmp s e ii flag
+    lf="${LEASE_FILE:-}"
+    [ -z "$lf" ] && have_uci && lf=$(uci -q get dhcp.@dnsmasq[0].leasefile)
+    lf="${lf:-/tmp/dhcp.leases}"
+    [ -f "$lf" ] || die "no lease file at $lf"
+    tmp=$(mktemp); parse_ranges "$tmp" 2>/dev/null || true
+    printf '%-15s  %-17s  %-12s  %-10s  %s\n' IP MAC VENDOR GROUP HOSTNAME
+    while read -r exp mac ip host rest; do
+        v=$(vendor_of "$mac"); g=$(group_of "$v"); flag=""
+        ii=$(ip2int "$ip" 2>/dev/null) || continue
+        # which group's range is this IP actually in? (none = reservation/static)
+        in_g=$(awk -v i="$ii" '$1=="G" && i>=$3 && i<=$4 {print $2; exit}' "$tmp")
+        if [ -z "$in_g" ]; then
+            flag="  (reserved)"
+        elif [ "$g" != - ] && [ "$in_g" != "$g" ]; then
+            flag="  <- in $in_g range, expected $g (old lease? reboot device or wait for renewal)"
+        fi
+        [ "$host" = "*" ] && host=-
+        printf '%-15s  %-17s  %-12s  %-10s  %s%s\n' "$ip" "$mac" "$v" "$g" "$host" "$flag"
+    done < "$lf" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
+    rm -f "$tmp"
+}
+
+case "${1:-}" in
+    generate) generate ;;
+    apply)    apply ;;
+    revert)   revert ;;
+    leases)   leases ;;
+    vendor)   [ -n "${2:-}" ] || die "usage: avdhcp vendor MAC"
+              v=$(vendor_of "$2"); echo "$2  vendor=$v  group=$(group_of "$v")" ;;
+    *) sed -n '2,10s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac
